@@ -29,6 +29,19 @@
   有快照但缺可靠身份（升级前保存）的版本只展示各版本原貌，不虚构逐事件差值。
 - **旧库历史版本**：升级前只有推算结果、缺少完整输入快照的历史版本，会在版本列表中
   明确标记为「不可回看、不可恢复」，不会用当前输入冒充；老接口行为保持不变。
+- **跨复盘并入事件链（本轮新增）**：可把**另一份复盘**某一**可回看版本**的事件
+  并入当前复盘。选定来源复盘、来源版本与事件集合后先**预览**（只读，不改任何
+  版本）：预览列出将复制的事件、仅**两端均入选**才复制的“先于”关系（保留最短/
+  最长等待）、未复制关系及原因，以及合并后的推算结论。确认时按目标
+  `base_version` 重新核对：目标未变化则结论必须与预览一致（以推算结果签名
+  校验），随后**一次性保存为目标的新草稿版本**（`kind=merge`，记录来源复盘与
+  版本）。复制事件保留时间范围（含 IANA 时区与 UTC 偏移）、持续分钟、备注，
+  关系保留等待上下界，但**在目标取得全新的持续身份（uid）**，不沿用来源身份；
+  目标原有事件、目标旧版本与来源复盘的历史均不改变。不产生跨组关系（目标旧
+  关系只连目标事件、复制关系只连复制事件），因此带时区与未带时区事件不会被
+  跨组连接。来源与目标相同、所选事件不存在、来源版本缺快照或输入不合法一律
+  拒绝（400/404/422）且无部分写入；`base_version` 过期沿用 409；预览与确认
+  不一致同样返回 409；合并出的冲突/暂存结果可保存为草稿但不得定稿。
 - **冲突处理**：约束冲突时保留全部输入，指出冲突事件及双方依据链（正推最早可行开始
   与反推最晚可行开始两条相反依据链），该版本**不得定稿**。冲突按成因归因：
   - `invalid_range`：输入范围自相矛盾（最早开始晚于最晚开始）；
@@ -102,6 +115,8 @@ python3 tests/test_api.py      # HTTP API 端到端测试（间隔校验、409�
 python3 tests/test_compare.py  # 版本对照测试（身份配对、差值、只读、错误路径）
 python3 tests/test_timezone.py # 跨地区时区单元测试（夏令时 gap/重复时刻、绝对分钟推算、当地展示）
 python3 tests/test_api_timezone.py # 跨地区时区 HTTP API 端到端测试（400 拒绝、回看/恢复/对照保留时区）
+python3 tests/test_merge.py    # 跨复盘并入单元测试（预览只读、仅两端入选、新身份、409/422 拒绝）
+python3 tests/test_api_merge.py # 跨复盘并入 HTTP API 端到端测试（预览/确认、签名一致、无部分写入）
 ```
 
 > 跨地区时区依赖系统 IANA 时区库（Python 标准库 `zoneinfo` 读取
@@ -122,6 +137,8 @@ python3 tests/test_api_timezone.py # 跨地区时区 HTTP API 端到端测试（
 | GET | `/api/reviews/{id}/versions/{v}` | 版本回看：当时标题/事件/关系输入 + 推算依据与状态；旧库无快照返回 422 |
 | POST | `/api/reviews/{id}/versions/{v}/restore` | 恢复为新草稿版本 `{base_version}`；过期返回 409，旧库无快照返回 422 |
 | GET | `/api/reviews/{id}/compare?from={v1}&to={v2}` | 两版本对照（只读）：须 `v1 < v2`；顺序无效 400、版本不存在 404、旧库无快照 422 |
+| POST | `/api/reviews/{id}/merge/preview` | 并入预览（只读）：`{source_review_id, source_version, event_keys?}`；`event_keys` 省略/为 null = 全选。返回将复制的事件、仅两端入选的关系与合并后推算结论及 `signature`，不改任何版本；来源与目标相同/事件不存在/选择非法 400、来源版本不存在 404、来源缺快照 422 |
+| POST | `/api/reviews/{id}/merge/confirm` | 确认并入：`{source_review_id, source_version, event_keys?, base_version, signature}`；目标未变化且签名与预览一致时一次性保存为目标的新草稿版本（`kind=merge`）；`base_version` 过期 409、预览与确认不一致 409 |
 | DELETE | `/api/reviews/{id}` | 删除复盘 |
 
 ### 版本回看与恢复（HTTP 示例）
@@ -208,6 +225,84 @@ curl -s 'http://localhost:8000/api/reviews/1/compare?from=1&to=2'   # v1 为旧�
 页面上在「历史版本」面板上方的对照栏选择较早/较晚版本后点「对照这两个版本」即可
 查看同样内容（缺快照的旧版本在下拉中禁选）；对照弹窗分组展示新增/删除/改名事件、
 输入与推算窗口变化表、关系间隔变化、暂存状态变化与两版冲突对比。
+
+### 跨复盘并入事件链（本轮新增，HTTP 示例）
+
+把**另一份复盘**（`source_review_id`）某一可回看版本（`source_version`）的事件
+并入当前复盘（路径中的 `{id}` 为目标）。先预览，再确认。
+
+```bash
+# 0) 选定来源版本后，用版本回看拿到事件 key（快照 key 形如 id_<行号>）
+curl -s http://localhost:8000/api/reviews/7/versions/3
+# {"version": 3, "input": {"events": [
+#   {"key":"id_4","uid":"...","name":"上海告警","timezone":"Asia/Shanghai",
+#    "earliest_start":"2026-10-01T10:00+08:00","latest_start":"2026-10-01T10:00+08:00",
+#    "duration_minutes":15,"note":"..."},
+#   {"key":"id_5",...,"name":"纽约响应",...},
+#   {"key":"id_6",...,"name":"待定（暂存）",...}],
+#  "relations":[{"predecessor_key":"id_4","successor_key":"id_5",
+#                "min_gap_minutes":10,"max_gap_minutes":60},
+#               {"predecessor_key":"id_4","successor_key":"id_6"}]}, ...}
+
+# 1) 预览（只读，不改任何版本）。event_keys 省略/null 表示全选
+curl -s -X POST http://localhost:8000/api/reviews/2/merge/preview \
+  -H 'Content-Type: application/json' -d '{
+    "source_review_id": 7, "source_version": 3,
+    "event_keys": ["id_4", "id_5"]}'
+# {"target_review_id": 2, "target_version": 4, "target_title": "本次复盘",
+#  "source_review_id": 7, "source_title": "支付故障复盘", "source_version": 3,
+#  "selected_keys": ["id_4","id_5"],
+#  "counts": {"source_events_total": 3, "target_events": 1, "copied_events": 2,
+#             "target_relations": 0, "copied_relations": 1, "skipped_relations": 1},
+#  "events": {
+#    "target": [{"compute_id": 0, "uid": "<目标事件原身份>", "name": "本地根因会", ...}],
+#    "copied": [{"compute_id": 1, "name": "上海告警", "timezone": "Asia/Shanghai",
+#                "earliest_start": "2026-10-01T10:00+08:00", "duration_minutes": 15,
+#                "note": "..."}            # 注意：复制事件不带 uid（身份在目标重新取得）
+#              , {"compute_id": 2, ...}]},
+#  "relations": {
+#    "target": [...],
+#    "copied": [{"predecessor": {"compute_id": 1, "name": "上海告警"},
+#                "successor":   {"compute_id": 2, "name": "纽约响应"},
+#                "min_gap_minutes": 10, "max_gap_minutes": 60}],
+#    "skipped": [{"predecessor": {...}, "successor": {"name": "待定（暂存）", ...},
+#                 "reason": "仅复制两端事件均入选的关系；事件「待定（暂存）」未入选，该关系不复制"}]},
+#  "result": {"status": "ok",
+#             "windows": {"2": {"timezone": "America/New_York",
+#                                "earliest_start": "2026-09-30T22:25-04:00", ...}},
+#             "conflicts": [], "drafts": [], "skipped_relations": []},
+#  "signature": "<推算结果规范化签名，确认时原样回传>"}
+# 说明：预览的 events/relations/windows 用“合并序号”标识（目标在前、复制在后），
+#       与来源/目标的行号无关；确认保存后的窗口值与预览逐项一致（仅行号不同）。
+
+# 2) 确认：携带目标当前 base_version 与预览 signature，一次性保存为新草稿版本
+curl -s -X POST http://localhost:8000/api/reviews/2/merge/confirm \
+  -H 'Content-Type: application/json' -d '{
+    "source_review_id": 7, "source_version": 3,
+    "event_keys": ["id_4", "id_5"],
+    "base_version": 4, "signature": "<上一步预览返回的 signature>"}'
+# 成功：200，返回与 GET /api/reviews/2 相同的新快照（version=5，status="draft"）。
+# 新版本 GET .../versions/5 的 kind="merge"、source_review_id=7、source_version=3；
+# 复制事件带全新 uid（目标旧事件 uid 不变），来源 #7 的历史与目标旧版本均不改变。
+
+# 3) 拒绝与冲突
+#   来源与目标相同          → 400 {"error": "来源复盘与目标复盘必须不同……"}
+#   所选事件不存在/空/重复   → 400 {"error": "所选事件在来源版本中不存在：……"}
+#   缺 source_review_id 等   → 400
+#   来源版本不存在           → 404 {"error": "来源版本不存在"}
+#   来源是旧库缺快照版本      → 422 {"error": "来源版本缺少完整输入快照，无法并入",
+#                                    "reviewable": false}
+#   base_version 过期        → 409 {"error": "……请刷新后重试", "current_version": 5}
+#   目标未变但选择/签名不一致 → 409 {"error": "并入确认与预览不一致……",
+#                                    "current_version": 4, "current_signature": "..."}
+# 所有拒绝路径均无部分写入；合并出冲突/暂存结论时确认仍可保存为草稿，但
+# finalize 仍返回 400（不得定稿）。
+```
+
+页面上在「并入其他复盘的事件链」面板选择来源复盘与可回看版本 → 「载入该版本
+事件」勾选要复制的事件 → 「预览并入」查看将复制的事件/关系与合并推算结论
+（只读弹窗）→「确认并入，保存为新草稿版本」。版本列表中并入产生的新版本标注
+「并入产生」，版本回看会注明来源复盘与来源版本。
 
 ### “先于”关系的间隔设置（HTTP 示例）
 
@@ -374,6 +469,7 @@ app/
   compute.py         时间窗推算与依据链生成（含间隔上下界传播、跨时区绝对分钟推算）
   tzutil.py          IANA 时区与带偏移当地时间校验（夏令时 gap/重复时刻）、按时区展示
   compare.py         版本对照：跨版本按 uid 配对与差值计算（纯函数，只读）
+  merge.py           跨复盘并入：选择规则、仅两端入选关系、序号重算与预览签名（纯函数，只读）
   static/            浏览器单页界面（原生 HTML/JS/CSS）
 tests/test_compute.py  推算引擎单元测试
 tests/test_versions.py 版本快照/回看/恢复与旧库兼容测试
@@ -381,5 +477,7 @@ tests/test_api.py      HTTP API 端到端测试
 tests/test_compare.py  版本对照测试（身份配对、差值、只读、错误路径）
 tests/test_timezone.py 跨地区时区单元测试（偏移/夏令时校验、绝对分钟推算）
 tests/test_api_timezone.py 跨地区时区 HTTP API 端到端测试
+tests/test_merge.py     跨复盘并入单元测试（预览只读、新身份、拒绝路径）
+tests/test_api_merge.py 跨复盘并入 HTTP API 端到端测试（预览/确认/409/422）
 Dockerfile / docker-compose.yml / .dockerignore
 ```

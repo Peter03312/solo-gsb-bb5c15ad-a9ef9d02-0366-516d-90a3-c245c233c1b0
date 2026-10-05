@@ -89,6 +89,33 @@
     <div id="windows"></div>
   </section>
 
+  <section class="panel" id="merge">
+    <h2>并入其他复盘的事件链</h2>
+    <p class="hint">把<strong>另一份复盘</strong>某一可回看版本的事件复制进当前复盘：可挑选要复制的事件，
+      “先于”关系仅在两端事件都入选时一并复制（保留最短/最长等待）；复制来的事件保留时间范围（含时区与 UTC 偏移）、
+      持续分钟与备注，但会在当前复盘取得<strong>新的持续身份</strong>，当前复盘原有事件与来源复盘的历史均不改变。
+      先预览（<strong>不改任何版本</strong>），确认后一次性保存为当前复盘的新草稿版本。</p>
+    <div class="merge-bar">
+      <label>来源复盘 <select id="merge-review"></select></label>
+      <label>来源版本 <select id="merge-version"></select></label>
+      <button id="btn-merge-load">载入该版本事件</button>
+      <button id="btn-merge-preview" class="primary" disabled>预览并入</button>
+    </div>
+    <div id="merge-picker" class="merge-picker hidden">
+      <div class="merge-picker-head">
+        <span class="hint">勾选要复制的事件（关系仅复制两端均勾选的）：</span>
+        <button id="btn-merge-all" type="button">全选</button>
+        <button id="btn-merge-none" type="button">全不选</button>
+      </div>
+      <table id="merge-events-table">
+        <thead>
+          <tr><th></th><th>事件名称</th><th>时区</th><th>最早开始</th><th>最晚开始</th><th>持续(分钟)</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
   <section class="panel" id="history">
     <div class="history-head">
       <h2>历史版本（可回看 / 可恢复 / 可对照）</h2>
@@ -120,6 +147,21 @@
     </div>
     <div id="cm-meta" class="hint"></div>
     <div id="cm-body" class="modal-body"></div>
+  </div>
+</div>
+
+<div id="merge-modal" class="modal-mask hidden">
+  <div class="modal modal-wide">
+    <div class="modal-head">
+      <span id="mm-title" class="vm-title"></span>
+      <button id="btn-mm-close" title="关闭">✕</button>
+    </div>
+    <div id="mm-meta" class="hint"></div>
+    <div id="mm-body" class="modal-body"></div>
+    <div class="modal-foot">
+      <span class="hint">确认时按当前 base_version 重新核对；目标未变化则结论与本预览一致，保存为新草稿版本。</span>
+      <button id="btn-mm-confirm" class="primary">确认并入，保存为新草稿版本</button>
+    </div>
   </div>
 </div>
 

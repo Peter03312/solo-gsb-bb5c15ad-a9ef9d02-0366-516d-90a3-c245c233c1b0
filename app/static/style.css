@@ -160,3 +160,22 @@ table.cmp th, table.cmp td { padding: 4px 6px; }
 .card.diff-add { border-color: var(--ok); }
 .card.diff-del { border-color: var(--err); }
 .card.diff-rename { border-color: var(--warn); }
+
+/* 跨复盘并入 */
+#merge { grid-column: 1 / -1; }
+.merge-bar {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  margin: 8px 0 12px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel2);
+}
+.merge-bar label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.merge-bar select { min-width: 200px; }
+.merge-picker { margin-top: 8px; }
+.merge-picker-head { display: flex; gap: 8px; align-items: center; }
+.merge-picker-head .hint { margin: 0; }
+#merge-events-table th:first-child, #merge-events-table td:first-child { width: 32px; text-align: center; }
+tr.merge-copy-row td { background: rgba(79,140,255,.08); }
+.kind-tag.merge-tag { color: var(--accent); border-color: var(--accent); }
+.modal-wide { width: min(1080px, 100%); }
+.modal-foot .hint { margin: 0 12px 0 0; flex: 1; }
+.modal-foot { display: flex; align-items: center; }

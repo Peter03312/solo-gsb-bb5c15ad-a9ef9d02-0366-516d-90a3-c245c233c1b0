@@ -13,6 +13,8 @@
   GET    /api/reviews/{id}/versions/{v}   某版本回看：当时输入 + 推算依据 + 状态
   POST   /api/reviews/{id}/versions/{v}/restore  恢复为新草稿版本 {base_version}
   GET    /api/reviews/{id}/compare?from={v1}&to={v2}  两版本对照（只读，按事件持续身份配对）
+  POST   /api/reviews/{id}/merge/preview              并入预览（只读，不改任何版本）
+  POST   /api/reviews/{id}/merge/confirm              确认并入：一次性保存为目标的新草稿版本
   DELETE /api/reviews/{id}        删除复盘
 
 并发控制：所有修改请求必须携带 base_version，与服务器当前版本一致才接受，
@@ -188,6 +190,45 @@ def validate_payload(body):
     return body["base_version"], title, events, relations
 
 
+def validate_merge_request(body, require_base_and_signature):
+    """校验跨复盘并入请求体。
+
+    require_base_and_signature=False（预览）：仅需来源复盘、来源版本、
+    event_keys（可空 = 全选）；base_version 可选，由服务器在响应中给出
+    当前权威版本。
+    require_base_and_signature=True（确认）：必须携带 base_version 与
+    预览返回的 signature。
+    """
+    if not isinstance(body, dict):
+        raise ApiError(400, "请求体必须是 JSON 对象")
+
+    def as_int(name):
+        v = body.get(name)
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ApiError(400, "缺少 {}".format(name))
+        return v
+
+    source_review_id = as_int("source_review_id")
+    source_version = as_int("source_version")
+    keys = body.get("event_keys")
+    if keys is not None:
+        if not isinstance(keys, list) or any(
+                not isinstance(k, str) or not k for k in keys):
+            raise ApiError(400, "event_keys 必须是事件 key 字符串数组，或留空表示全选")
+    base_version = body.get("base_version")
+    signature = body.get("signature")
+    if require_base_and_signature:
+        if not isinstance(base_version, int) or isinstance(base_version, bool):
+            raise ApiError(400, "缺少 base_version（用于并发版本校验）")
+        if not isinstance(signature, str) or not signature:
+            raise ApiError(400, "缺少 signature（取自并入预览响应；用于校验推算结论与预览一致）")
+    else:
+        base_version = base_version if isinstance(base_version, int) and not isinstance(
+            base_version, bool) else None
+        signature = signature if isinstance(signature, str) else None
+    return source_review_id, source_version, keys, base_version, signature
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RetroTimeline/1.0"
     protocol_version = "HTTP/1.1"
@@ -315,6 +356,10 @@ class Handler(BaseHTTPRequestHandler):
                         "version": e.args[0] if e.args else None,
                     })
 
+            m = re.fullmatch(r"/api/reviews/(\d+)/merge/(preview|confirm)", path)
+            if m and method == "POST":
+                return self._handle_merge(int(m.group(1)), m.group(2))
+
             raise ApiError(404, "not found")
         except ApiError as e:
             self._send_json(e.status, e.payload)
@@ -334,6 +379,37 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(e)})
         except db.FinalizeRejected as e:
             self._send_json(400, {"error": str(e)})
+
+    def _handle_merge(self, rid, action):
+        """跨复盘并入：预览（只读）/ 确认（保存为目标新草稿版本）。
+
+        并入特有的错误在此给出专属文案（如来源版本缺快照 422、确认与预览
+        不一致 409）；目标/来源复盘不存在与 base_version 过期仍交由外层
+        统一映射为 404 / 409。
+        """
+        src_rid, src_ver, event_keys, base_version, signature = \
+            validate_merge_request(self._read_json(), action == "confirm")
+        try:
+            if action == "preview":
+                return self._send_json(200, db.preview_merge(
+                    DB_PATH, rid, src_rid, src_ver, event_keys))
+            db.merge_review(DB_PATH, rid, src_rid, src_ver, event_keys,
+                            base_version, signature)
+            return self._send_json(200, db.get_bundle(DB_PATH, rid))
+        except db.InvalidMerge as e:
+            return self._send_json(400, {"error": str(e)})
+        except db.StalePreview as e:
+            return self._send_json(409, {
+                "error": "并入确认与预览不一致：目标版本未变化，但所选事件集合或"
+                         "推算结论与预览不同，请重新预览后再确认",
+                "current_version": db.current_version(DB_PATH, rid),
+                "current_signature": e.args[0] if e.args else None,
+            })
+        except db.VersionNotFound:
+            return self._send_json(404, {"error": "来源版本不存在"})
+        except db.LegacyVersion:
+            return self._send_json(422, {"error": db.LEGACY_MERGE_REASON,
+                                         "reviewable": False})
 
     def do_GET(self):
         self._dispatch("GET")

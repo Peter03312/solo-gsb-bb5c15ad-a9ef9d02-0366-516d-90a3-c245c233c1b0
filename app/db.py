@@ -18,9 +18,11 @@ from datetime import datetime
 
 import compare
 import compute
+import merge
 
 LEGACY_REASON = "历史版本缺少完整输入快照，不可回看、不可恢复"
 LEGACY_COMPARE_REASON = "历史版本缺少完整输入快照，无法比较"
+LEGACY_MERGE_REASON = "来源版本缺少完整输入快照，无法并入"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
@@ -62,10 +64,11 @@ CREATE TABLE IF NOT EXISTS snapshots (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
     review_version INTEGER NOT NULL,
-    kind           TEXT NOT NULL,                  -- save | finalize | restore
+    kind           TEXT NOT NULL,                  -- save | finalize | restore | merge
     title          TEXT NOT NULL,                 -- 不可变的标题快照
     input_json     TEXT NOT NULL,                 -- 不可变输入：{events, relations}
-    source_version INTEGER,                       -- restore/finalize 沿用的来源版本
+    source_version INTEGER,                       -- restore/finalize/merge 沿用的来源版本
+    source_review_id INTEGER,                     -- merge：来源复盘（跨复盘并入）
     created_at     TEXT NOT NULL,
     UNIQUE(review_id, review_version)
 );
@@ -96,6 +99,14 @@ class FinalizeRejected(Exception):
 
 class InvalidCompareOrder(Exception):
     """版本对照的较早/较晚顺序无效（须 from_version < to_version）。"""
+
+
+class InvalidMerge(Exception):
+    """跨复盘并入的输入不合法（同复盘并入、事件不存在、选择集非法等）。"""
+
+
+class StalePreview(Exception):
+    """确认并入时所选事件集合与预览不一致（目标 base_version 未变化前提下）。"""
 
 
 def _now():
@@ -146,6 +157,9 @@ def _migrate(conn):
             conn.execute("UPDATE events SET uid=? WHERE id=?", (_new_uid(), eid))
     if "timezone" not in event_cols:
         conn.execute("ALTER TABLE events ADD COLUMN timezone TEXT")
+    snap_cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
+    if "source_review_id" not in snap_cols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN source_review_id INTEGER")
 
 
 def connect(db_path):
@@ -259,6 +273,7 @@ def list_versions(db_path, review_id):
                     "created_at": snap["created_at"],
                     "title": snap["title"],
                     "source_version": snap["source_version"],
+                    "source_review_id": snap["source_review_id"],
                 })
         return versions
     finally:
@@ -286,6 +301,7 @@ def _version_snapshot(conn, review_id, version):
         "kind": snap["kind"],
         "title": snap["title"],
         "source_version": snap["source_version"],
+        "source_review_id": snap["source_review_id"],
         "created_at": snap["created_at"],
         "status": comp["status"],
         "computed_at": comp["computed_at"],
@@ -388,7 +404,7 @@ def _current_input(conn, review_id):
 
 
 def _save_version(conn, review_id, version, title, events, relations, kind, now=None,
-                  source_version=None):
+                  source_version=None, source_review_id=None):
     """运行推算并写入该版本的 computations 与不可变 snapshots 记录。
 
     events/relations 为 compute 引擎所需的 live 行（含数字 id）；
@@ -416,8 +432,9 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
         {"events": snapshot_events, "relations": snapshot_relations}, ensure_ascii=False)
     conn.execute(
         "INSERT INTO snapshots (review_id, review_version, kind, title, input_json,"
-        " source_version, created_at) VALUES (?,?,?,?,?,?,?)",
-        (review_id, version, kind, title, input_json, source_version, now))
+        " source_version, source_review_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (review_id, version, kind, title, input_json, source_version,
+         source_review_id, now))
     return result
 
 
@@ -598,5 +615,126 @@ def delete_review(db_path, review_id):
         conn.commit()
         if cur.rowcount == 0:
             raise NotFound(review_id)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------- 跨复盘并入
+
+def _merge_review_meta(conn, review_id):
+    """读取复盘标题（并入预览需要）。不存在抛 NotFound。"""
+    row = conn.execute("SELECT title FROM reviews WHERE id=?", (review_id,)).fetchone()
+    if row is None:
+        raise NotFound(review_id)
+    return row["title"]
+
+
+def _source_snapshot_for_merge(conn, source_review_id, source_version):
+    """读取来源复盘某可回看版本的标题与不可变输入，供并入使用。
+
+    来源复盘不存在抛 NotFound；版本不存在抛 VersionNotFound；旧库缺
+    完整输入快照的版本抛 LegacyVersion。
+    """
+    title = _merge_review_meta(conn, source_review_id)
+    data = _version_snapshot(conn, source_review_id, source_version)
+    return {"id": source_review_id, "title": title, "version": source_version,
+            "input": data["input"]}
+
+
+def preview_merge(db_path, target_review_id, source_review_id, source_version,
+                  selected_keys):
+    """只读预览：返回将复制的事件、入选关系与合并后的推算结论。
+
+    不写任何版本、不改任何输入。来源/目标相同、事件不存在、来源版本缺
+    快照、选择集非法分别抛 InvalidMerge / VersionNotFound / LegacyVersion。
+    """
+    if target_review_id == source_review_id:
+        raise InvalidMerge("来源复盘与目标复盘必须不同，不能把一份复盘的事件链并入自身")
+    conn = connect(db_path)
+    try:
+        target_row = conn.execute(
+            "SELECT * FROM reviews WHERE id=?", (target_review_id,)).fetchone()
+        if target_row is None:
+            raise NotFound(target_review_id)
+        source = _source_snapshot_for_merge(conn, source_review_id, source_version)
+        _t_events, _t_relations, t_snap_events, t_snap_relations = _current_input(
+            conn, target_review_id)
+        target = {"id": target_review_id, "title": target_row["title"],
+                  "version": target_row["version"],
+                  "input": {"events": t_snap_events, "relations": t_snap_relations}}
+    finally:
+        conn.close()
+    try:
+        plan = merge.build_merge_plan(target, source, selected_keys)
+    except merge.InvalidMergeSelection as e:
+        raise InvalidMerge(str(e))
+    return {
+        "target_review_id": target_review_id,
+        "target_version": target_row["version"],
+        "target_title": target_row["title"],
+        "source_review_id": source_review_id,
+        "source_title": source["title"],
+        "source_version": source_version,
+        "selected_keys": plan["selected_keys"],
+        "counts": plan["counts"],
+        "events": plan["events"],
+        "relations": plan["relations"],
+        "result": plan["result"],
+        "signature": plan["signature"],
+    }
+
+
+def merge_review(db_path, target_review_id, source_review_id, source_version,
+                 selected_keys, base_version, expected_signature):
+    """确认并入：原子保存为目标复盘的新草稿版本。
+
+    按 base_version 重新核对：目标已变化抛 VersionConflict（409）；目标
+    未变化时重算计划，推算签名与预览不一致抛 StalePreview（409）。
+    成功后一次性替换目标输入并写入 kind='merge' 的新版本；原有目标事件
+    与来源历史均不改变，复制来的事件在目标分配全新 uid（新持续身份）。
+    """
+    if target_review_id == source_review_id:
+        raise InvalidMerge("来源复盘与目标复盘必须不同，不能把一份复盘的事件链并入自身")
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM reviews WHERE id=?", (target_review_id,)).fetchone()
+        if row is None:
+            raise NotFound(target_review_id)
+        if row["version"] != base_version:
+            raise VersionConflict(row["version"])
+        source = _source_snapshot_for_merge(conn, source_review_id, source_version)
+        _te, _tr, t_snap_events, t_snap_relations = _current_input(conn, target_review_id)
+        target = {"id": target_review_id, "title": row["title"],
+                  "version": row["version"],
+                  "input": {"events": t_snap_events, "relations": t_snap_relations}}
+        try:
+            plan = merge.build_merge_plan(target, source, selected_keys)
+        except merge.InvalidMergeSelection as e:
+            raise InvalidMerge(str(e))
+        if expected_signature != plan["signature"]:
+            # 目标版本未变却签名不一致：选择集与预览不符或请求被篡改，
+            # 绝不保存，沿用 409 冲突语义（无部分写入）。
+            raise StalePreview(plan["signature"])
+
+        _replace_input(conn, target_review_id,
+                       plan["merged_events"], plan["merged_relations"])
+        live_events, live_relations, _, _ = _current_input(conn, target_review_id)
+
+        new_version = base_version + 1
+        now = _now()
+        # 并入产生的永远是新草稿：合并出的冲突或暂存结果允许保存，但不得定稿
+        conn.execute(
+            "UPDATE reviews SET version=?, status='draft', updated_at=? WHERE id=?",
+            (new_version, now, target_review_id))
+        _save_version(conn, target_review_id, new_version, row["title"],
+                      live_events, live_relations, "merge", now,
+                      source_version=source_version, source_review_id=source_review_id)
+        conn.commit()
+        return new_version
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()

@@ -9,6 +9,8 @@ const state = {
   editEvents: [],     // 编辑中的事件 [{key, id?, name, earliest_start, latest_start, duration_minutes, note}]
   editRelations: [],  // 编辑中的关系 [{predecessor_key, successor_key, min_gap_minutes, max_gap_minutes}]
   seq: 0,
+  mergeSource: null,   // 当前选定的来源快照 {reviewId, version}
+  mergePreview: null,  // 最近一次预览响应（确认时回传 signature/event_keys）
 };
 
 function newKey() { return "k" + (++state.seq) + "_" + Date.now(); }
@@ -61,6 +63,8 @@ async function openReview(id) {
   hideBanner();
   render();
   loadVersions().catch((err) => showBanner("⚠ 版本列表加载失败：" + escapeHtml(err.message)));
+  loadMergeReviews().catch((err) =>
+    showBanner("⚠ 来源复盘列表加载失败：" + escapeHtml(err.message)));
 }
 
 function resetEdits() {
@@ -500,6 +504,7 @@ function fillCompareSelects(versions, currentVersion) {
 function kindTag(v) {
   if (v.kind === "finalize") return `<span class="kind-tag finalize">已定稿</span>`;
   if (v.kind === "restore") return `<span class="kind-tag restore">恢复产生</span>`;
+  if (v.kind === "merge") return `<span class="kind-tag merge-tag">并入产生</span>`;
   if (v.kind === "save") return `<span class="kind-tag">保存</span>`;
   return `<span class="kind-tag">历史记录</span>`;
 }
@@ -525,6 +530,9 @@ async function openVersion(version) {
   let meta = `推算状态：${detail.status === "ok" ? "通过" : "冲突"}`;
   if (detail.kind === "restore" && detail.source_version) {
     meta += `　|　由 v${detail.source_version} 恢复而来`;
+  }
+  if (detail.kind === "merge" && detail.source_version) {
+    meta += `　|　由复盘 #${detail.source_review_id || "?"} v${detail.source_version} 并入而来`;
   }
   meta += `　|　推算时间：${(detail.computed_at || "").replace("T", " ")}`;
   $("#vm-meta").textContent = meta;
@@ -768,6 +776,245 @@ function compareDiffHtml(data) {
   return html;
 }
 
+/* ------------------------------------------------------------ 跨复盘并入 */
+
+async function loadMergeReviews(preferId) {
+  const data = await api("GET", "/api/reviews");
+  state.reviews = data.reviews;
+  const sel = $("#merge-review");
+  sel.innerHTML = "";
+  for (const r of data.reviews) {
+    const opt = document.createElement("option");
+    opt.value = r.id;
+    opt.textContent = `#${r.id} ${r.title}（v${r.version}）`;
+    if (state.current && r.id === state.current.review.id) {
+      opt.textContent += " —— 当前复盘（不可选）";
+      opt.disabled = true;
+    }
+    sel.appendChild(opt);
+  }
+  const firstOther = data.reviews.find(
+    (r) => !state.current || r.id !== state.current.review.id);
+  sel.value = preferId
+    ? String(preferId)
+    : (firstOther ? String(firstOther.id) : "");
+  await loadMergeVersions();
+}
+
+async function loadMergeVersions() {
+  const rid = parseInt($("#merge-review").value, 10);
+  const sel = $("#merge-version");
+  sel.innerHTML = "";
+  state.mergeSource = null;
+  $("#merge-picker").classList.add("hidden");
+  $("#btn-merge-preview").disabled = true;
+  if (!rid) return;
+  let data;
+  try {
+    data = await api("GET", `/api/reviews/${rid}/versions`);
+  } catch (err) {
+    showBanner("⚠ 来源版本列表加载失败：" + escapeHtml(err.message));
+    return;
+  }
+  const asc = data.versions.filter((v) => v.reviewable)
+    .sort((a, b) => a.version - b.version);
+  if (!asc.length) {
+    const opt = document.createElement("option");
+    opt.textContent = "（无可回看版本）";
+    opt.disabled = true;
+    sel.appendChild(opt);
+    return;
+  }
+  for (const v of asc) {
+    const opt = document.createElement("option");
+    opt.value = v.version;
+    opt.textContent = `v${v.version}` +
+      (v.status === "conflict" ? "（冲突）" : v.has_drafts ? "（有暂存）" : "") +
+      (v.kind === "finalize" ? "（已定稿）" : "");
+    sel.appendChild(opt);
+  }
+  sel.value = String(asc[asc.length - 1].version);
+}
+
+async function loadMergeEvents() {
+  const rid = parseInt($("#merge-review").value, 10);
+  const ver = parseInt($("#merge-version").value, 10);
+  if (!rid || !ver) return;
+  let detail;
+  try {
+    detail = await api("GET", `/api/reviews/${rid}/versions/${ver}`);
+  } catch (err) {
+    showBanner("⚠ 来源版本无法回看：" + escapeHtml(err.message));
+    return;
+  }
+  state.mergeSource = { reviewId: rid, version: ver, detail };
+  const tbody = $("#merge-events-table tbody");
+  tbody.innerHTML = "";
+  for (const e of detail.input.events || []) {
+    const tr = document.createElement("tr");
+    tr.dataset.key = e.key;
+    const isDraft = !e.earliest_start || !e.latest_start || e.duration_minutes === null ||
+      e.duration_minutes === undefined;
+    tr.innerHTML =
+      `<td><input type="checkbox" class="merge-pick" checked></td>` +
+      `<td>${escapeHtml(e.name)}${isDraft ? ' <span class="badge warn">暂存</span>' : ""}</td>` +
+      `<td>${escapeHtml(e.timezone || "")}</td>` +
+      `<td>${fmtTime(e.earliest_start)}</td>` +
+      `<td>${fmtTime(e.latest_start)}</td>` +
+      `<td>${e.duration_minutes === null || e.duration_minutes === undefined ? "—" : e.duration_minutes}</td>`;
+    tbody.appendChild(tr);
+  }
+  $("#merge-picker").classList.remove("hidden");
+  $("#btn-merge-preview").disabled = (detail.input.events || []).length === 0;
+  hideBanner();
+}
+
+function pickedMergeKeys() {
+  return [...document.querySelectorAll("#merge-events-table tbody tr")]
+    .filter((tr) => tr.querySelector(".merge-pick").checked)
+    .map((tr) => tr.dataset.key);
+}
+
+function mergeEventFields(e) {
+  // 合并预览的事件视图转换为结果渲染所需结构（compute_id 即窗口键）
+  return {
+    id: e.compute_id,
+    name: e.name,
+    duration_minutes: e.duration_minutes,
+    timezone: e.timezone,
+  };
+}
+
+function mergeEndpointsHtml(endpoint) {
+  const id = endpoint.compute_id === null || endpoint.compute_id === undefined
+    ? "?" : endpoint.compute_id;
+  const name = endpoint.name || "?";
+  return { id, name };
+}
+
+function mergeRelationsHtml(list) {
+  return list.map((r) => {
+    const a = mergeEndpointsHtml(r.predecessor);
+    const b = mergeEndpointsHtml(r.successor);
+    return `<div>「${escapeHtml(a.name)}」先于「${escapeHtml(b.name)}」${escapeHtml(gapText(r))}</div>`;
+  }).join("");
+}
+
+function renderMergePreview(data) {
+  const evByKey = {};
+  for (const e of data.events.target.concat(data.events.copied)) {
+    evByKey[String(e.compute_id)] = mergeEventFields(e);
+  }
+  const parts = buildResultHtml(data.result, evByKey);
+  const c = data.counts;
+  const meta =
+    `来源：#${data.source_review_id} ${data.source_title} v${data.source_version}` +
+    `　→　目标：#${data.target_review_id} ${data.target_title} v${data.target_version}`;
+  $("#mm-meta").textContent = meta;
+
+  const rows = (list, tag, badge) => list.map((e) =>
+    `<tr class="${tag}"><td>${e.compute_id}</td><td>${escapeHtml(e.name)}` +
+    (badge || "") + `</td><td>${escapeHtml(e.timezone || "")}</td>` +
+    `<td>${fmtTime(e.earliest_start)}</td><td>${fmtTime(e.latest_start)}</td>` +
+    `<td>${e.duration_minutes === null || e.duration_minutes === undefined ? "—" : e.duration_minutes}</td>` +
+    `<td>${escapeHtml(e.note || "")}</td></tr>`).join("");
+
+  let html =
+    `<div class="summary ok">将复制 <strong>${c.copied_events}</strong> 个事件` +
+    `（来源共 ${c.source_events_total} 个），复制 <strong>${c.copied_relations}</strong> 条关系` +
+    `（两端均入选），跳过 ${c.skipped_relations} 条；目标原有 ${c.target_events} 个事件、` +
+    `${c.target_relations} 条关系保持不变。预览<strong>不修改任何版本</strong>。</div>` +
+    `<table><thead><tr><th>推算序号</th><th>事件名称</th><th>时区</th>` +
+    `<th>最早开始</th><th>最晚开始</th><th>持续(分钟)</th><th>备注</th></tr></thead><tbody>` +
+    rows(data.events.target, "", "") +
+    rows(data.events.copied, "merge-copy-row", ' <span class="kind-tag merge-tag">复制</span>') +
+    `</tbody></table>`;
+
+  html += `<div class="section-title">合并后的“先于”关系</div><div class="vm-relations">`;
+  html += mergeRelationsHtml(data.relations.target.concat(data.relations.copied)) ||
+    `<div class="hint">无</div>`;
+  html += `</div>`;
+
+  if (data.relations.skipped.length) {
+    html += `<details><summary>未复制的来源关系（${data.relations.skipped.length}）</summary>` +
+      data.relations.skipped.map((s) =>
+        `<div class="card draft"><div>「${escapeHtml(s.predecessor.name || "?")}」先于` +
+        `「${escapeHtml(s.successor.name || "?")}」${escapeHtml(gapText(s))}</div>` +
+        `<div class="reason">${escapeHtml(s.reason)}</div></div>`).join("") +
+      `</details>`;
+  }
+
+  html += `<div class="section-title">合并后的推算结论（确认保存后与目标新版本一致）</div>` +
+    parts.summary + parts.conflicts + parts.drafts + parts.skipped + parts.windows;
+  return html;
+}
+
+async function previewMerge() {
+  if (!state.current || !state.mergeSource) return;
+  const keys = pickedMergeKeys();
+  if (!keys.length) {
+    showBanner("⚠ 请至少勾选一个要复制的事件");
+    return;
+  }
+  let data;
+  try {
+    data = await api("POST",
+      `/api/reviews/${state.current.review.id}/merge/preview`, {
+        source_review_id: state.mergeSource.reviewId,
+        source_version: state.mergeSource.version,
+        event_keys: keys,
+      });
+  } catch (err) {
+    showBanner("⚠ 并入预览失败：" + escapeHtml(err.message || "未知错误"));
+    return;
+  }
+  state.mergePreview = data;
+  $("#mm-title").textContent = "并入预览（只读，未保存）";
+  $("#mm-body").innerHTML = renderMergePreview(data);
+  $("#btn-mm-confirm").disabled = false;
+  hideBanner();
+  $("#merge-modal").classList.remove("hidden");
+}
+
+function closeMergeModal() { $("#merge-modal").classList.add("hidden"); }
+
+async function confirmMerge() {
+  if (!state.current || !state.mergePreview) return;
+  const pv = state.mergePreview;
+  if (!confirm(`确认把 #${pv.source_review_id}「${pv.source_title}」v${pv.source_version} 中` +
+               ` ${pv.counts.copied_events} 个事件并入当前复盘吗？\n` +
+               `将一次性保存为当前复盘的新草稿版本（基于 v${pv.target_version}），` +
+               `原有目标事件与来源历史均不改变。`)) {
+    return;
+  }
+  try {
+    const bundle = await api("POST",
+      `/api/reviews/${state.current.review.id}/merge/confirm`, {
+        source_review_id: pv.source_review_id,
+        source_version: pv.source_version,
+        event_keys: pv.selected_keys,
+        base_version: state.current.review.version,
+        signature: pv.signature,
+      });
+    closeMergeModal();
+    state.mergePreview = null;
+    state.current = bundle;
+    resetEdits();
+    hideBanner();
+    render();
+    await loadVersions();
+    await loadReviews(bundle.review.id);
+    await loadMergeReviews();
+    showMergeSuccess(bundle.review.version);
+  } catch (err) {
+    handleSaveError(err);
+  }
+}
+
+function showMergeSuccess(v) {
+  showBanner(`<div>✓ 已并入并保存为新草稿版本 v${v}（冲突/暂存结果可保存但不得定稿）。</div>`);
+}
+
 /* ---------------------------------------------------------------- 事件绑定 */
 
 $("#btn-new").addEventListener("click", async () => {
@@ -796,6 +1043,21 @@ $("#btn-reload-versions").addEventListener("click", () => {
   if (state.current) loadVersions();
 });
 $("#btn-compare").addEventListener("click", openCompare);
+
+$("#merge-review").addEventListener("change", loadMergeVersions);
+$("#btn-merge-load").addEventListener("click", loadMergeEvents);
+$("#btn-merge-preview").addEventListener("click", previewMerge);
+$("#btn-merge-all").addEventListener("click", () => {
+  document.querySelectorAll("#merge-events-table .merge-pick").forEach((cb) => { cb.checked = true; });
+});
+$("#btn-merge-none").addEventListener("click", () => {
+  document.querySelectorAll("#merge-events-table .merge-pick").forEach((cb) => { cb.checked = false; });
+});
+$("#btn-mm-close").addEventListener("click", closeMergeModal);
+$("#btn-mm-confirm").addEventListener("click", confirmMerge);
+$("#merge-modal").addEventListener("click", (e) => {
+  if (e.target.id === "merge-modal") closeMergeModal();
+});
 $("#btn-cm-close").addEventListener("click", closeCompareModal);
 $("#compare-modal").addEventListener("click", (e) => {
   if (e.target.id === "compare-modal") closeCompareModal();
