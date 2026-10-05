@@ -144,6 +144,25 @@ summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 #vm-body table input { pointer-events: none; }
 .vm-relations { color: var(--muted); font-size: 13px; line-height: 1.9; }
 
+/* 并入其他复盘 */
+.merge-bar {
+  margin: 8px 0 12px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel2);
+}
+.merge-bar-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.merge-bar-head strong { font-size: 13px; }
+.merge-fields { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.merge-fields label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.merge-fields select { min-width: 200px; max-width: 320px; }
+.merge-picker { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 10px; }
+.merge-picker .mp-actions { display: flex; gap: 8px; margin: 6px 0 10px; align-items: center; }
+table.merge-events th, table.merge-events td { font-size: 12px; padding: 4px 6px; }
+.mp-rel { color: var(--muted); font-size: 12px; line-height: 1.8; }
+.mp-rel-on { color: var(--ok); }
+.mp-rel-off { opacity: .75; }
+.modal-foot { gap: 12px; }
+.modal-foot #mm-note { margin-right: auto; }
+
 /* 版本对照 */
 .compare-bar {
   display: flex; gap: 10px; align-items: center; flex-wrap: wrap;

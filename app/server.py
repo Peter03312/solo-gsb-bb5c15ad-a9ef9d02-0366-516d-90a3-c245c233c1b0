@@ -13,6 +13,8 @@
   GET    /api/reviews/{id}/versions/{v}   某版本回看：当时输入 + 推算依据 + 状态
   POST   /api/reviews/{id}/versions/{v}/restore  恢复为新草稿版本 {base_version}
   GET    /api/reviews/{id}/compare?from={v1}&to={v2}  两版本对照（只读，按事件持续身份配对）
+  POST   /api/reviews/{id}/merge/preview              并入预览（只读）：{source_review_id, source_version, event_uids}
+  POST   /api/reviews/{id}/merge/confirm              确认并入，另存为新草稿版本：{source_review_id, source_version, event_uids, base_version, digest}
   DELETE /api/reviews/{id}        删除复盘
 
 并发控制：所有修改请求必须携带 base_version，与服务器当前版本一致才接受，
@@ -188,6 +190,44 @@ def validate_payload(body):
     return body["base_version"], title, events, relations
 
 
+def validate_merge_body(body, require_base=False):
+    """校验并入请求体，返回 (source_review_id, source_version, event_uids, base_version)。
+
+    预览与确认共用来源参数校验；确认额外要求 base_version 为整数。
+    来源/目标相同、事件不存在等业务校验在 db 层完成（拒绝且无部分写入）。
+    """
+    if not isinstance(body, dict):
+        raise ApiError(400, "请求体必须是 JSON 对象")
+    sid = body.get("source_review_id")
+    sver = body.get("source_version")
+    if not isinstance(sid, int) or isinstance(sid, bool) or sid <= 0:
+        raise ApiError(400, "缺少有效的 source_review_id（来源复盘 id）")
+    if not isinstance(sver, int) or isinstance(sver, bool) or sver <= 0:
+        raise ApiError(400, "缺少有效的 source_version（来源复盘的可回看版本号）")
+    uids = body.get("event_uids")
+    if not isinstance(uids, list) or not uids:
+        raise ApiError(400, "缺少 event_uids：必须至少选择一个来源事件的 uid")
+    if len(uids) > 10000:
+        raise ApiError(400, "event_uids 数量超出合理范围")
+    clean = []
+    for u in uids:
+        if not isinstance(u, str) or not u.strip():
+            raise ApiError(400, "event_uids 必须是非空字符串（来源事件的持续身份 uid）")
+        if len(u) > 64:
+            raise ApiError(400, "event_uids 中存在非法的 uid")
+        clean.append(u.strip())
+    if len(set(clean)) != len(clean):
+        raise ApiError(400, "event_uids 中存在重复的事件 uid")
+    base_version = None
+    if require_base:
+        base_version = body.get("base_version")
+        if not isinstance(base_version, int) or isinstance(base_version, bool):
+            raise ApiError(400, "缺少 base_version（用于并发版本校验）")
+        if not isinstance(body.get("digest"), str) or not body.get("digest", "").strip():
+            raise ApiError(400, "缺少 digest（预览返回的合并内容核对值）")
+    return sid, sver, clean, base_version
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RetroTimeline/1.0"
     protocol_version = "HTTP/1.1"
@@ -315,6 +355,34 @@ class Handler(BaseHTTPRequestHandler):
                         "version": e.args[0] if e.args else None,
                     })
 
+            m = re.fullmatch(r"/api/reviews/(\d+)/merge/(preview|confirm)", path)
+            if m and method == "POST":
+                rid = int(m.group(1))
+                action = m.group(2)
+                body = self._read_json()
+                if action == "preview":
+                    sid, sver, uids, _ = validate_merge_body(body, require_base=False)
+                    try:
+                        return self._send_json(200, db.preview_merge(
+                            DB_PATH, rid, sid, sver, uids))
+                    except db.LegacyVersion:
+                        return self._send_json(422, {
+                            "error": db.LEGACY_MERGE_REASON,
+                            "mergable": False,
+                            "source_review_id": sid, "source_version": sver,
+                        })
+                sid, sver, uids, base_version = validate_merge_body(body, require_base=True)
+                try:
+                    db.merge_into_review(DB_PATH, rid, sid, sver, uids,
+                                         base_version, body["digest"])
+                except db.LegacyVersion:
+                    return self._send_json(422, {
+                        "error": db.LEGACY_MERGE_REASON,
+                        "mergable": False,
+                        "source_review_id": sid, "source_version": sver,
+                    })
+                return self._send_json(200, db.get_bundle(DB_PATH, rid))
+
             raise ApiError(404, "not found")
         except ApiError as e:
             self._send_json(e.status, e.payload)
@@ -331,6 +399,8 @@ class Handler(BaseHTTPRequestHandler):
                 "current_version": e.current_version,
             })
         except db.InvalidCompareOrder as e:
+            self._send_json(400, {"error": str(e)})
+        except db.MergeRejected as e:
             self._send_json(400, {"error": str(e)})
         except db.FinalizeRejected as e:
             self._send_json(400, {"error": str(e)})

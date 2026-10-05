@@ -95,6 +95,20 @@
       <button id="btn-reload-versions" title="重新加载版本列表">刷新版本</button>
     </div>
     <p class="hint">每次保存或定稿都会留存不可变的标题、事件与“先于”关系输入快照。恢复会把旧版本输入另存为当前复盘的新草稿版本并重新推算，不会覆盖任何旧版本。</p>
+
+    <div class="merge-bar">
+      <div class="merge-bar-head">
+        <strong>并入另一份复盘的历史事件链</strong>
+        <span class="hint">先预览（只读，不改任何版本），确认后一次性另存为当前复盘的新草稿版本。</span>
+      </div>
+      <div class="merge-fields">
+        <label>来源复盘 <select id="merge-review"></select></label>
+        <label>来源版本 <select id="merge-version"></select></label>
+        <button id="btn-merge-load">加载该版本事件</button>
+      </div>
+      <div id="merge-event-picker" class="merge-picker hidden"></div>
+    </div>
+
     <div class="compare-bar">
       <label>较早版本 <select id="compare-from"></select></label>
       <label>较晚版本 <select id="compare-to"></select></label>
@@ -120,6 +134,21 @@
     </div>
     <div id="cm-meta" class="hint"></div>
     <div id="cm-body" class="modal-body"></div>
+  </div>
+</div>
+
+<div id="merge-modal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="mm-title" class="vm-title"></span>
+      <button id="btn-mm-close" title="关闭">✕</button>
+    </div>
+    <div id="mm-meta" class="hint"></div>
+    <div id="mm-body" class="modal-body"></div>
+    <div class="modal-foot">
+      <span id="mm-note" class="hint"></span>
+      <button id="btn-mm-confirm" class="primary">确认并入，另存为新草稿版本</button>
+    </div>
   </div>
 </div>
 

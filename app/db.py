@@ -4,10 +4,15 @@
 分表保存；每次成功修改都会写入一条新的 computations 记录。
 通过 reviews.version 实现乐观锁：携带旧版本号的提交会被拒绝。
 
-版本回看：每次保存/定稿/恢复成功时，除 computations 外另写一条不可变的
+版本回看：每次保存/定稿/恢复/并入成功时，除 computations 外另写一条不可变的
 snapshots 记录，留存当时的标题、事件、“先于”关系输入，与该版本的推算结果
 一一对应。旧库中只有 computations、没有 snapshots 的历史版本视为不可回看、
-不可恢复，列表中明确标记，绝不用当前输入冒充。
+不可恢复（也不可作为并入来源），列表中明确标记，绝不用当前输入冒充。
+
+跨复盘并入（merge）：预览只读组装合并输入并推算；确认在一个事务内完成版本
+核对、digest 核对、整体替换、重新推算与新快照写入（kind=merge，记录来源
+复盘/版本），失败回滚，绝不产生部分写入。复制事件由 _replace_input 分配
+全新 uid，目标原有事件与来源历史均不变。
 """
 
 import json
@@ -18,9 +23,11 @@ from datetime import datetime
 
 import compare
 import compute
+import merge
 
 LEGACY_REASON = "历史版本缺少完整输入快照，不可回看、不可恢复"
 LEGACY_COMPARE_REASON = "历史版本缺少完整输入快照，无法比较"
+LEGACY_MERGE_REASON = "来源版本缺少完整输入快照，不可并入"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
@@ -62,10 +69,11 @@ CREATE TABLE IF NOT EXISTS snapshots (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
     review_version INTEGER NOT NULL,
-    kind           TEXT NOT NULL,                  -- save | finalize | restore
+    kind           TEXT NOT NULL,                  -- save | finalize | restore | merge
     title          TEXT NOT NULL,                 -- 不可变的标题快照
     input_json     TEXT NOT NULL,                 -- 不可变输入：{events, relations}
-    source_version INTEGER,                       -- restore/finalize 沿用的来源版本
+    source_version INTEGER,                       -- restore/finalize/merge 沿用的来源版本
+    source_review_id INTEGER,                     -- merge：来源复盘 id
     created_at     TEXT NOT NULL,
     UNIQUE(review_id, review_version)
 );
@@ -96,6 +104,10 @@ class FinalizeRejected(Exception):
 
 class InvalidCompareOrder(Exception):
     """版本对照的较早/较晚顺序无效（须 from_version < to_version）。"""
+
+
+class MergeRejected(Exception):
+    """并入输入不合法：来源/目标相同、事件不存在、选择非法等（HTTP 400）。"""
 
 
 def _now():
@@ -131,6 +143,9 @@ def _migrate(conn):
 
     events.timezone 同为可空迁移列：旧行与旧快照没有该列（视为未指定
     时区），继续按朴素本地时间的既有语义处理，绝不回填时区。
+
+    snapshots.source_review_id 同为可空迁移列：并入产生的版本用它记录
+    来源复盘，旧快照该列为 NULL。
     """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(relations)")}
     if "min_gap_minutes" not in cols:
@@ -146,6 +161,10 @@ def _migrate(conn):
             conn.execute("UPDATE events SET uid=? WHERE id=?", (_new_uid(), eid))
     if "timezone" not in event_cols:
         conn.execute("ALTER TABLE events ADD COLUMN timezone TEXT")
+    snap_cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
+    if "source_review_id" not in snap_cols:
+        # 并入产生的版本需记录来源复盘；旧快照该列为 NULL
+        conn.execute("ALTER TABLE snapshots ADD COLUMN source_review_id INTEGER")
 
 
 def connect(db_path):
@@ -259,6 +278,7 @@ def list_versions(db_path, review_id):
                     "created_at": snap["created_at"],
                     "title": snap["title"],
                     "source_version": snap["source_version"],
+                    "source_review_id": snap["source_review_id"],
                 })
         return versions
     finally:
@@ -286,6 +306,7 @@ def _version_snapshot(conn, review_id, version):
         "kind": snap["kind"],
         "title": snap["title"],
         "source_version": snap["source_version"],
+        "source_review_id": snap["source_review_id"],
         "created_at": snap["created_at"],
         "status": comp["status"],
         "computed_at": comp["computed_at"],
@@ -388,7 +409,7 @@ def _current_input(conn, review_id):
 
 
 def _save_version(conn, review_id, version, title, events, relations, kind, now=None,
-                  source_version=None):
+                  source_version=None, source_review_id=None):
     """运行推算并写入该版本的 computations 与不可变 snapshots 记录。
 
     events/relations 为 compute 引擎所需的 live 行（含数字 id）；
@@ -416,8 +437,9 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
         {"events": snapshot_events, "relations": snapshot_relations}, ensure_ascii=False)
     conn.execute(
         "INSERT INTO snapshots (review_id, review_version, kind, title, input_json,"
-        " source_version, created_at) VALUES (?,?,?,?,?,?,?)",
-        (review_id, version, kind, title, input_json, source_version, now))
+        " source_version, source_review_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (review_id, version, kind, title, input_json, source_version,
+         source_review_id, now))
     return result
 
 
@@ -543,6 +565,135 @@ def restore_review(db_path, review_id, base_version, source_version):
             (title, new_version, now, review_id))
         _save_version(conn, review_id, new_version, title, live_events, live_relations,
                       "restore", now, source_version=source_version)
+        conn.commit()
+        return new_version
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _build_merge_plan(conn, target_id, source_id, source_version, selected_uids):
+    """在已有连接上取齐目标 live 输入与来源快照，构建并入规划（不写库）。"""
+    target = conn.execute("SELECT * FROM reviews WHERE id=?", (target_id,)).fetchone()
+    if target is None:
+        raise NotFound(target_id)
+    if source_id == target_id:
+        raise MergeRejected("来源复盘与目标复盘不能相同")
+    source = conn.execute("SELECT id, title FROM reviews WHERE id=?", (source_id,)).fetchone()
+    if source is None:
+        raise NotFound(source_id)
+    source_data = _version_snapshot(conn, source_id, source_version)  # 旧库缺快照抛 LegacyVersion
+    _live_events, _live_relations, snap_events, _snap_rels = _current_input(conn, target_id)
+    try:
+        plan = merge.build_plan(snap_events, _live_events, _live_relations,
+                                source_data, selected_uids)
+    except merge.MergeError as e:
+        # 纯规划层的输入不合法统一转为 db 层的并入拒绝（HTTP 400，无部分写入）
+        raise MergeRejected(str(e))
+    return plan, target, source, source_data
+
+
+def _preview_payload(plan, target, source, source_data, target_id, source_id, source_version):
+    """由规划组装预览响应（只读，不改任何版本）。"""
+    src_by_uid = {e["uid"]: e for e in source_data["input"]["events"]}
+
+    def copied_event_view(e):
+        return {
+            "uid": e.get("uid"),
+            "name": e.get("name"),
+            "earliest_start": e.get("earliest_start"),
+            "latest_start": e.get("latest_start"),
+            "duration_minutes": e.get("duration_minutes"),
+            "note": e.get("note") or "",
+            "timezone": e.get("timezone"),
+        }
+
+    copied_relations = []
+    for r in plan["copied_relations"]:
+        ae, be = src_by_uid[r["predecessor_uid"]], src_by_uid[r["successor_uid"]]
+        copied_relations.append({
+            "predecessor": {"uid": r["predecessor_uid"], "name": ae.get("name")},
+            "successor": {"uid": r["successor_uid"], "name": be.get("name")},
+            "min_gap_minutes": r["min_gap_minutes"],
+            "max_gap_minutes": r["max_gap_minutes"],
+        })
+    return {
+        "target": {
+            "review_id": target_id,
+            "title": target["title"],
+            "base_version": target["version"],
+            "status": target["status"],
+        },
+        "source": {
+            "review_id": source_id,
+            "title": source_data.get("title") or source["title"],
+            "version": source_version,
+            "kind": source_data.get("kind"),
+            "state": source_data.get("state"),
+        },
+        "copied_events": [copied_event_view(e) for e in plan["copied_events"]],
+        "copied_relations": copied_relations,
+        "result": plan["result"],
+        "digest": plan["digest"],
+    }
+
+
+def preview_merge(db_path, target_id, source_id, source_version, selected_uids):
+    """并入预览：返回复制事件、两端均入选的关系与合并后推算结论。只读，不写库。
+
+    来源/目标相同、事件不存在、来源版本缺快照、选择不合法均抛相应异常，
+    不产生任何部分写入。
+    """
+    conn = connect(db_path)
+    try:
+        plan, target, source, source_data = _build_merge_plan(
+            conn, target_id, source_id, source_version, selected_uids)
+        return _preview_payload(plan, target, source, source_data,
+                                target_id, source_id, source_version)
+    finally:
+        conn.close()
+
+
+def merge_into_review(db_path, target_id, source_id, source_version,
+                      selected_uids, base_version, digest):
+    """确认并入：按目标 base_version 重新核对，一次性保存为目标的新草稿版本。
+
+    目标版本未变化时重建规划的 digest 必须与预览一致（一致 ⇒ 合并输入相同
+    ⇒ 推算结论与预览相同）；版本过期抛 VersionConflict；digest 不符抛
+    MergeRejected。复制事件保留时间范围/持续/备注/时区与 UTC 偏移，在
+    目标取得全新持续身份；关系保留等待上下界。目标原有事件与来源历史不变。
+    冲突或暂存的合并结果允许保存为草稿，但仍不得定稿。
+    """
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        plan, target, _source, _source_data = _build_merge_plan(
+            conn, target_id, source_id, source_version, selected_uids)
+        if target["version"] != base_version:
+            raise VersionConflict(target["version"])
+        if not isinstance(digest, str) or not digest.strip():
+            raise MergeRejected("缺少预览 digest，无法核对合并内容")
+        if plan["digest"] != digest.strip():
+            raise MergeRejected(
+                "合并内容与预览不一致（目标可能已重新保存，或选择/来源版本被改动），"
+                "请重新预览后再确认")
+
+        events, relations = merge.save_payload(plan)
+        _resolve_event_uids(conn, target_id, events)
+        _replace_input(conn, target_id, events, relations)
+        live_events, live_relations, _, _ = _current_input(conn, target_id)
+
+        new_version = base_version + 1
+        title = target["title"]
+        now = _now()
+        # 并入产生的永远是新草稿：冲突或暂存结果可保存，但仍不得定稿
+        conn.execute(
+            "UPDATE reviews SET title=?, version=?, status='draft', updated_at=? WHERE id=?",
+            (title, new_version, now, target_id))
+        _save_version(conn, target_id, new_version, title, live_events, live_relations,
+                      "merge", now, source_version=source_version, source_review_id=source_id)
         conn.commit()
         return new_version
     except Exception:
